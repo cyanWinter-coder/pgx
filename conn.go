@@ -965,18 +965,30 @@ func (c *Conn) sendBatch(ctx context.Context, b *Batch) (br BatchResults) {
 		return &emptyBatchResults{conn: c}
 	}
 
+	earlyBatchErr := func() error {
+		if er, ok := br.(interface{ earlyError() error }); ok {
+			return er.earlyError()
+		}
+		return nil
+	}
+
 	if c.batchTracer != nil {
 		ctx = c.batchTracer.TraceBatchStart(ctx, c, TraceBatchStartData{Batch: b})
 		defer func() {
-			err := br.(interface{ earlyError() error }).earlyError()
+			err := earlyBatchErr()
+			invalidateCachesOnBatchResultsError(c, b, err)
 			if err != nil {
 				c.batchTracer.TraceBatchEnd(ctx, c, TraceBatchEndData{Err: err})
 			}
 		}()
+	} else {
+		defer func() {
+			invalidateCachesOnBatchResultsError(c, b, earlyBatchErr())
+		}()
 	}
 
 	if err := c.deallocateInvalidatedCachedStatements(ctx); err != nil {
-		return &batchResults{ctx: ctx, conn: c, err: err}
+		return &batchResults{ctx: ctx, conn: c, b: b, err: err}
 	}
 
 	for _, bi := range b.QueuedQueries {
@@ -1000,7 +1012,7 @@ func (c *Conn) sendBatch(ctx context.Context, b *Batch) (br BatchResults) {
 			var err error
 			sql, arguments, err = queryRewriter.RewriteQuery(ctx, c, sql, arguments)
 			if err != nil {
-				return &batchResults{ctx: ctx, conn: c, err: fmt.Errorf("rewrite query failed: %w", err)}
+				return &batchResults{ctx: ctx, conn: c, b: b, err: fmt.Errorf("rewrite query failed: %w", err)}
 			}
 		}
 
@@ -1045,7 +1057,7 @@ func (c *Conn) sendBatchQueryExecModeSimpleProtocol(ctx context.Context, b *Batc
 		}
 		sql, err := c.sanitizeForSimpleQuery(bi.SQL, bi.Arguments...)
 		if err != nil {
-			return &batchResults{ctx: ctx, conn: c, err: err}
+			return &batchResults{ctx: ctx, conn: c, b: b, err: err}
 		}
 		sb.WriteString(sql)
 	}
@@ -1067,14 +1079,14 @@ func (c *Conn) sendBatchQueryExecModeExec(ctx context.Context, b *Batch) *batchR
 		if sd != nil {
 			err := c.eqb.Build(c.typeMap, sd, bi.Arguments)
 			if err != nil {
-				return &batchResults{ctx: ctx, conn: c, err: err}
+				return &batchResults{ctx: ctx, conn: c, b: b, err: err}
 			}
 
 			batch.ExecPrepared(sd.Name, c.eqb.ParamValues, c.eqb.ParamFormats, c.eqb.ResultFormats)
 		} else {
 			err := c.eqb.Build(c.typeMap, nil, bi.Arguments)
 			if err != nil {
-				return &batchResults{ctx: ctx, conn: c, err: err}
+				return &batchResults{ctx: ctx, conn: c, b: b, err: err}
 			}
 			batch.ExecParams(bi.SQL, c.eqb.ParamValues, nil, c.eqb.ParamFormats, c.eqb.ResultFormats)
 		}
@@ -1095,7 +1107,7 @@ func (c *Conn) sendBatchQueryExecModeExec(ctx context.Context, b *Batch) *batchR
 
 func (c *Conn) sendBatchQueryExecModeCacheStatement(ctx context.Context, b *Batch) (pbr *pipelineBatchResults) {
 	if c.statementCache == nil {
-		return &pipelineBatchResults{ctx: ctx, conn: c, err: errDisabledStatementCache, closed: true}
+		return &pipelineBatchResults{ctx: ctx, conn: c, b: b, err: errDisabledStatementCache, closed: true}
 	}
 
 	distinctNewQueries := []*pgconn.StatementDescription{}
@@ -1127,7 +1139,7 @@ func (c *Conn) sendBatchQueryExecModeCacheStatement(ctx context.Context, b *Batc
 
 func (c *Conn) sendBatchQueryExecModeCacheDescribe(ctx context.Context, b *Batch) (pbr *pipelineBatchResults) {
 	if c.descriptionCache == nil {
-		return &pipelineBatchResults{ctx: ctx, conn: c, err: errDisabledDescriptionCache, closed: true}
+		return &pipelineBatchResults{ctx: ctx, conn: c, b: b, err: errDisabledDescriptionCache, closed: true}
 	}
 
 	distinctNewQueries := []*pgconn.StatementDescription{}
@@ -1244,32 +1256,38 @@ func (c *Conn) sendBatchExtendedWithDescription(ctx context.Context, b *Batch, d
 			return nil
 		}()
 		if err != nil {
-			return &pipelineBatchResults{ctx: ctx, conn: c, err: err, closed: true}
+			return &pipelineBatchResults{ctx: ctx, conn: c, b: b, err: err, closed: true}
+		}
+	}
+
+	// Build every set of arguments before queueing any query. A build failure is a preprocessing failure: no Bind or
+	// Execute message may be queued, and the pipeline can be closed without discarding an unsynced query.
+	builders := make([]ExtendedQueryBuilder, len(b.QueuedQueries))
+	for i, bi := range b.QueuedQueries {
+		if err := builders[i].Build(c.typeMap, bi.sd, bi.Arguments); err != nil {
+			err = newErrPreprocessingBatch("build", bi.SQL, err)
+			return &pipelineBatchResults{ctx: ctx, conn: c, b: b, err: err, closed: true}
 		}
 	}
 
 	// Queue the queries.
-	for _, bi := range b.QueuedQueries {
-		err := c.eqb.Build(c.typeMap, bi.sd, bi.Arguments)
-		if err != nil {
-			err = newErrPreprocessingBatch("build", bi.SQL, err)
-			return &pipelineBatchResults{ctx: ctx, conn: c, err: err, closed: true}
-		}
+	for i, bi := range b.QueuedQueries {
+		eqb := &builders[i]
 
 		if bi.sd.Name == "" {
-			pipeline.SendQueryParams(bi.sd.SQL, c.eqb.ParamValues, bi.sd.ParamOIDs, c.eqb.ParamFormats, c.eqb.ResultFormats)
+			pipeline.SendQueryParams(bi.sd.SQL, eqb.ParamValues, bi.sd.ParamOIDs, eqb.ParamFormats, eqb.ResultFormats)
 		} else {
-			// Copy ResultFormats because SendQueryStatement stores the slice for later use, and eqb.Build reuses the
-			// backing array on the next iteration.
-			resultFormats := make([]int16, len(c.eqb.ResultFormats))
-			copy(resultFormats, c.eqb.ResultFormats)
-			pipeline.SendQueryStatement(bi.sd, c.eqb.ParamValues, c.eqb.ParamFormats, resultFormats)
+			// SendQueryStatement stores ResultFormats until its result is read. Copy it so the pipeline does not retain
+			// the per-query builder's slice backing array after this function returns.
+			resultFormats := make([]int16, len(eqb.ResultFormats))
+			copy(resultFormats, eqb.ResultFormats)
+			pipeline.SendQueryStatement(bi.sd, eqb.ParamValues, eqb.ParamFormats, resultFormats)
 		}
 	}
 
 	err := pipeline.Sync()
 	if err != nil {
-		return &pipelineBatchResults{ctx: ctx, conn: c, err: err, closed: true}
+		return &pipelineBatchResults{ctx: ctx, conn: c, b: b, err: err, closed: true}
 	}
 
 	return &pipelineBatchResults{

@@ -9,6 +9,19 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// Sentinel errors returned by BatchResults implementations. They allow callers to use errors.Is instead of matching
+// error strings.
+var (
+	// ErrBatchClosed is returned when a batch result is read after Close.
+	ErrBatchClosed = errors.New("batch already closed")
+
+	// ErrBatchEmpty is returned when there are no more queued results to read.
+	ErrBatchEmpty = errors.New("no more results in batch")
+
+	// ErrBatchReference is returned when a pipeline result has no reference to its Batch.
+	ErrBatchReference = errors.New("no reference to batch")
+)
+
 // QueuedQuery is a query that has been queued for execution via a [Batch].
 type QueuedQuery struct {
 	SQL       string
@@ -105,10 +118,14 @@ func (b *Batch) Len() int {
 type BatchResults interface {
 	// Exec reads the results from the next query in the batch as if the query has been sent with [Conn.Exec]. Prefer
 	// calling Exec on the QueuedQuery, or just calling Close.
+	//
+	// Once reading the batch has reached a terminal error, Exec continues to return that same error.
 	Exec() (pgconn.CommandTag, error)
 
 	// Query reads the results from the next query in the batch as if the query has been sent with [Conn.Query]. Prefer
 	// calling [QueuedQuery.Query].
+	//
+	// Once reading the batch has reached a terminal error, Query continues to return that same error.
 	Query() (Rows, error)
 
 	// QueryRow reads the results from the next query in the batch as if the query has been sent with [Conn.QueryRow].
@@ -117,7 +134,8 @@ type BatchResults interface {
 
 	// Close closes the batch operation. All unread results are read and any callback functions registered with
 	// [QueuedQuery.Query], [QueuedQuery.QueryRow], or [QueuedQuery.Exec] will be called. If a callback function returns an
-	// error or the batch encounters an error subsequent callback functions will not be called.
+	// error or the batch encounters an error subsequent callback functions will not be called. If a Rows value returned by
+	// Query is still open, Close closes it and discards any unconsumed rows before reading the remaining results.
 	//
 	// For simple batch inserts inside a transaction or similar queries, it's sufficient to not set any callbacks,
 	// and just handle the return value of Close.
@@ -141,6 +159,7 @@ type batchResults struct {
 	ctx       context.Context
 	conn      *Conn
 	mrr       *pgconn.MultiResultReader
+	lastRows  *baseRows
 	err       error
 	b         *Batch
 	qqIdx     int
@@ -154,7 +173,10 @@ func (br *batchResults) Exec() (pgconn.CommandTag, error) {
 		return pgconn.CommandTag{}, br.err
 	}
 	if br.closed {
-		return pgconn.CommandTag{}, fmt.Errorf("batch already closed")
+		return pgconn.CommandTag{}, ErrBatchClosed
+	}
+	if err := br.closeLastRows(); err != nil {
+		return pgconn.CommandTag{}, br.err
 	}
 
 	query, arguments, _ := br.nextQueryAndArgs()
@@ -163,8 +185,10 @@ func (br *batchResults) Exec() (pgconn.CommandTag, error) {
 
 	if !br.mrr.NextResult() {
 		err := br.mrr.Close()
-		if err == nil {
-			err = errors.New("no more results in batch")
+		if err != nil {
+			br.err = err
+		} else {
+			err = ErrBatchEmpty
 		}
 		if br.conn.batchTracer != nil {
 			br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
@@ -198,29 +222,36 @@ func (br *batchResults) Exec() (pgconn.CommandTag, error) {
 
 // Query reads the results from the next query in the batch as if the query has been sent with Query.
 func (br *batchResults) Query() (Rows, error) {
-	query, arguments, ok := br.nextQueryAndArgs()
-	if !ok {
-		query = "batch query"
-	}
-
 	if br.err != nil {
 		return &baseRows{err: br.err, closed: true}, br.err
 	}
 
 	if br.closed {
-		alreadyClosedErr := fmt.Errorf("batch already closed")
-		return &baseRows{err: alreadyClosedErr, closed: true}, alreadyClosedErr
+		return &baseRows{err: ErrBatchClosed, closed: true}, ErrBatchClosed
+	}
+
+	if err := br.closeLastRows(); err != nil {
+		return &baseRows{err: br.err, closed: true}, br.err
+	}
+
+	query, arguments, ok := br.nextQueryAndArgs()
+	if !ok {
+		query = "batch query"
 	}
 
 	rows := br.conn.getRows(br.ctx, query, arguments)
 	rows.batchTracer = br.conn.batchTracer
+	br.lastRows = rows
 
 	if !br.mrr.NextResult() {
 		rows.err = br.mrr.Close()
-		if rows.err == nil {
-			rows.err = errors.New("no more results in batch")
+		if rows.err != nil {
+			br.err = rows.err
+		} else {
+			rows.err = ErrBatchEmpty
 		}
 		rows.closed = true
+		br.lastRows = nil
 
 		if br.conn.batchTracer != nil {
 			br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
@@ -258,16 +289,18 @@ func (br *batchResults) Close() error {
 		invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
 	}()
 
-	if br.err != nil {
+	if br.closed {
 		return br.err
 	}
 
-	if br.closed {
-		return nil
+	// Discard the current result if the caller abandoned its Rows before it was fully consumed.
+	if err := br.closeLastRows(); err != nil && br.err == nil {
+		br.err = err
 	}
 
-	// Read and run fn for all remaining items
-	for br.err == nil && !br.closed && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
+	// Read and run fn for all remaining items. Once br.err is set the batch has reached its terminal state; pgconn
+	// drains/discards the rest below.
+	for br.err == nil && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
 		if br.b.QueuedQueries[br.qqIdx].Fn != nil {
 			err := br.b.QueuedQueries[br.qqIdx].Fn(br)
 			if err != nil {
@@ -280,12 +313,28 @@ func (br *batchResults) Close() error {
 
 	br.closed = true
 
-	err := br.mrr.Close()
-	if br.err == nil {
-		br.err = err
+	if br.mrr != nil {
+		err := br.mrr.Close()
+		if br.err == nil {
+			br.err = err
+		}
 	}
 
 	return br.err
+}
+
+func (br *batchResults) closeLastRows() error {
+	if br.lastRows == nil {
+		return nil
+	}
+
+	rows := br.lastRows
+	br.lastRows = nil
+	rows.Close()
+	if rows.err != nil && br.err == nil {
+		br.err = rows.err
+	}
+	return rows.err
 }
 
 func (br *batchResults) Tx() Tx {
@@ -325,10 +374,9 @@ func (br *pipelineBatchResults) Exec() (pgconn.CommandTag, error) {
 		return pgconn.CommandTag{}, br.err
 	}
 	if br.closed {
-		return pgconn.CommandTag{}, fmt.Errorf("batch already closed")
+		return pgconn.CommandTag{}, ErrBatchClosed
 	}
-	if br.lastRows != nil && br.lastRows.err != nil {
-		br.err = br.lastRows.err
+	if err := br.closeLastRows(); err != nil {
 		return pgconn.CommandTag{}, br.err
 	}
 
@@ -358,6 +406,7 @@ func (br *pipelineBatchResults) Exec() (pgconn.CommandTag, error) {
 		commandTag, br.err = results.Close()
 	default:
 		err = fmt.Errorf("unexpected pipeline result: %T", results)
+		br.err = err
 		if br.conn.batchTracer != nil {
 			br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
 				SQL:           query,
@@ -389,12 +438,10 @@ func (br *pipelineBatchResults) Query() (Rows, error) {
 	}
 
 	if br.closed {
-		alreadyClosedErr := fmt.Errorf("batch already closed")
-		return &baseRows{err: alreadyClosedErr, closed: true}, alreadyClosedErr
+		return &baseRows{err: ErrBatchClosed, closed: true}, ErrBatchClosed
 	}
 
-	if br.lastRows != nil && br.lastRows.err != nil {
-		br.err = br.lastRows.err
+	if err := br.closeLastRows(); err != nil {
 		return &baseRows{err: br.err, closed: true}, br.err
 	}
 
@@ -456,7 +503,7 @@ func (br *pipelineBatchResults) QueryRow() Row {
 func (br *pipelineBatchResults) Close() error {
 	defer func() {
 		if !br.endTraced {
-			if br.conn.batchTracer != nil {
+			if br.conn != nil && br.conn.batchTracer != nil {
 				br.conn.batchTracer.TraceBatchEnd(br.ctx, br.conn, TraceBatchEndData{Err: br.err})
 			}
 			br.endTraced = true
@@ -465,16 +512,19 @@ func (br *pipelineBatchResults) Close() error {
 		invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
 	}()
 
-	if br.err == nil && br.lastRows != nil && br.lastRows.err != nil {
-		br.err = br.lastRows.err
-	}
-
 	if br.closed {
 		return br.err
 	}
 
-	// Read and run fn for all remaining items
-	for br.err == nil && !br.closed && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
+	// Close and release the current Rows if the caller did not finish it. Closing the pgconn result reader also
+	// discards any unconsumed rows for this item.
+	if err := br.closeLastRows(); err != nil && br.err == nil {
+		br.err = err
+	}
+
+	// Read and run fn for all remaining items. Once br.err is set, skip user callbacks and let pipeline.Close drain
+	// the server's error/synchronization state.
+	for br.err == nil && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
 		if br.b.QueuedQueries[br.qqIdx].Fn != nil {
 			err := br.b.QueuedQueries[br.qqIdx].Fn(br)
 			if err != nil {
@@ -487,12 +537,28 @@ func (br *pipelineBatchResults) Close() error {
 
 	br.closed = true
 
-	err := br.pipeline.Close()
-	if br.err == nil {
-		br.err = err
+	if br.pipeline != nil {
+		err := br.pipeline.Close()
+		if br.err == nil {
+			br.err = err
+		}
 	}
 
 	return br.err
+}
+
+func (br *pipelineBatchResults) closeLastRows() error {
+	if br.lastRows == nil {
+		return nil
+	}
+
+	rows := br.lastRows
+	br.lastRows = nil
+	rows.Close()
+	if rows.err != nil && br.err == nil {
+		br.err = rows.err
+	}
+	return rows.err
 }
 
 func (br *pipelineBatchResults) Tx() Tx {
@@ -505,11 +571,11 @@ func (br *pipelineBatchResults) earlyError() error {
 
 func (br *pipelineBatchResults) nextQueryAndArgs() (query string, args []any, err error) {
 	if br.b == nil {
-		return "", nil, errors.New("no reference to batch")
+		return "", nil, ErrBatchReference
 	}
 
 	if br.qqIdx >= len(br.b.QueuedQueries) {
-		return "", nil, errors.New("no more results in batch")
+		return "", nil, ErrBatchEmpty
 	}
 
 	bi := br.b.QueuedQueries[br.qqIdx]
@@ -525,20 +591,19 @@ type emptyBatchResults struct {
 // Exec reads the results from the next query in the batch as if the query has been sent with Exec.
 func (br *emptyBatchResults) Exec() (pgconn.CommandTag, error) {
 	if br.closed {
-		return pgconn.CommandTag{}, fmt.Errorf("batch already closed")
+		return pgconn.CommandTag{}, ErrBatchClosed
 	}
-	return pgconn.CommandTag{}, errors.New("no more results in batch")
+	return pgconn.CommandTag{}, ErrBatchEmpty
 }
 
 // Query reads the results from the next query in the batch as if the query has been sent with Query.
 func (br *emptyBatchResults) Query() (Rows, error) {
 	if br.closed {
-		alreadyClosedErr := fmt.Errorf("batch already closed")
-		return &baseRows{err: alreadyClosedErr, closed: true}, alreadyClosedErr
+		return &baseRows{err: ErrBatchClosed, closed: true}, ErrBatchClosed
 	}
 
 	rows := br.conn.getRows(context.Background(), "", nil)
-	rows.err = errors.New("no more results in batch")
+	rows.err = ErrBatchEmpty
 	rows.closed = true
 	return rows, rows.err
 }
