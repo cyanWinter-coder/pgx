@@ -31,12 +31,15 @@ type (
 // Config is the settings used to establish a connection to a PostgreSQL server. It must be created by [ParseConfig]. A
 // manually initialized Config will cause ConnectConfig to panic.
 type Config struct {
-	Host           string // host (e.g. localhost) or absolute path to unix domain socket directory (e.g. /private/tmp)
-	Port           uint16
-	Database       string
-	User           string
-	Password       string
-	TLSConfig      *tls.Config // nil disables TLS
+	Host      string // host (e.g. localhost) or absolute path to unix domain socket directory (e.g. /private/tmp)
+	Port      uint16
+	Database  string
+	User      string
+	Password  string
+	TLSConfig *tls.Config // nil disables TLS
+	// ConnectTimeout is the total time allowed for one ConnectConfig call to
+	// try all resolved addresses, hosts, and TLS fallbacks. When it elapses,
+	// fallback stops immediately.
 	ConnectTimeout time.Duration
 	DialFunc       DialFunc   // e.g. net.Dialer.DialContext
 	LookupFunc     LookupFunc // e.g. net.Resolver.LookupHost

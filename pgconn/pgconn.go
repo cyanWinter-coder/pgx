@@ -135,11 +135,14 @@ func ConnectWithOptions(ctx context.Context, connString string, parseConfigOptio
 }
 
 // Connect establishes a connection to a PostgreSQL server using config. config must have been constructed with
-// [ParseConfig]. ctx can be used to cancel a connect attempt.
+// [ParseConfig]. ctx can be used to cancel a connect attempt. Cancellation stops further fallback attempts and closes
+// any connection that was established but not delivered to the caller.
 //
 // If config.Fallbacks are present they will sequentially be tried in case of error establishing network connection. An
 // authentication error will terminate the chain of attempts (like libpq:
-// https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-MULTIPLE-HOSTS) and be returned as the error.
+// https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-MULTIPLE-HOSTS) and be returned as the error. An
+// error returned by Config.ValidateConnect rejects only that candidate and fallback continues. config.ConnectTimeout
+// is a single budget shared by all hosts, addresses, and TLS fallback attempts.
 func ConnectConfig(ctx context.Context, config *Config) (*PgConn, error) {
 	// Default values are set in ParseConfig. Enforce initial creation by ParseConfig rather than setting defaults from
 	// zero values.
@@ -154,9 +157,16 @@ func ConnectConfig(ctx context.Context, config *Config) (*PgConn, error) {
 		}
 	}
 
+	connectCtx := ctx
+	if config.ConnectTimeout != 0 {
+		var cancel context.CancelFunc
+		connectCtx, cancel = context.WithTimeout(ctx, config.ConnectTimeout)
+		defer cancel()
+	}
+
 	var allErrors []error
 
-	connectConfigs, errs := buildConnectOneConfigs(ctx, config)
+	connectConfigs, errs := buildConnectOneConfigs(connectCtx, config)
 	if len(errs) > 0 {
 		allErrors = append(allErrors, errs...)
 	}
@@ -165,7 +175,7 @@ func ConnectConfig(ctx context.Context, config *Config) (*PgConn, error) {
 		return nil, &ConnectError{Config: config, err: fmt.Errorf("hostname resolving error: %w", errors.Join(allErrors...))}
 	}
 
-	pgConn, errs := connectPreferred(ctx, config, connectConfigs)
+	pgConn, errs := connectPreferred(connectCtx, config, connectConfigs)
 	if len(errs) > 0 {
 		allErrors = append(allErrors, errs...)
 		return nil, &ConnectError{Config: config, err: errors.Join(allErrors...)}
@@ -174,9 +184,13 @@ func ConnectConfig(ctx context.Context, config *Config) (*PgConn, error) {
 	if config.AfterConnect != nil {
 		err := config.AfterConnect(ctx, pgConn)
 		if err != nil {
-			pgConn.conn.Close()
+			closeUndeliveredConnect(pgConn)
 			return nil, &ConnectError{Config: config, err: fmt.Errorf("AfterConnect error: %w", err)}
 		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		closeUndeliveredConnect(pgConn)
+		return nil, &ConnectError{Config: config, err: normalizeTimeoutError(ctx, ctxErr)}
 	}
 
 	return pgConn, nil
@@ -253,49 +267,89 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 // order. If a connection is successful it is returned. If no connection is successful then all errors are returned. If
 // a connection attempt returns a [NotPreferredError], then that host will be used if no other hosts are successful.
 func connectPreferred(ctx context.Context, config *Config, connectOneConfigs []*connectOneConfig) (*PgConn, []error) {
-	octx := ctx
+	// ConnectTimeout is one budget shared by every host, address, and TLS fallback attempt.
+	if config.ConnectTimeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, config.ConnectTimeout)
+		defer cancel()
+	}
+
 	var allErrors []error
 
+	// A network dial failure is independent of whether the attempt would next
+	// use TLS. sslmode=prefer emits TLS/plain candidates for the same host and
+	// resolved address. Suppress that redundant dial, while still allowing a
+	// different configured hostname that resolves to the same address to use
+	// its own TLS ServerName and validation.
+	dialFailedTargets := make(map[string]struct{})
+	dialTargetKey := func(c *connectOneConfig) string {
+		return c.originalHostname + "\x00" + c.network + "\x00" + c.address
+	}
+
 	var fallbackConnectOneConfig *connectOneConfig
-	for i, c := range connectOneConfigs {
-		// ConnectTimeout restricts the whole connection process.
-		if config.ConnectTimeout != 0 {
-			// create new context first time or when previous host was different
-			if i == 0 || (connectOneConfigs[i].address != connectOneConfigs[i-1].address) {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(octx, config.ConnectTimeout)
-				defer cancel()
-			}
-		} else {
-			ctx = octx
+	for _, c := range connectOneConfigs {
+		if err := ctx.Err(); err != nil {
+			return nil, appendContextDoneError(allErrors, err)
+		}
+
+		targetKey := dialTargetKey(c)
+		if _, failed := dialFailedTargets[targetKey]; failed {
+			continue
 		}
 
 		pgConn, err := connectOne(ctx, config, c, false)
-		if pgConn != nil {
+		if pgConn != nil && err == nil {
+			// The context can expire or be canceled after connectOne succeeds but
+			// before the connection is handed to the caller. Do not deliver such a
+			// connection.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				closeUndeliveredConnect(pgConn)
+				return nil, appendContextDoneError(allErrors, ctxErr)
+			}
 			return pgConn, nil
 		}
+		if pgConn != nil {
+			closeUndeliveredConnect(pgConn)
+		}
 
-		allErrors = append(allErrors, err)
+		if err != nil {
+			allErrors = append(allErrors, err)
+		}
+		if isDialConnectError(err) {
+			dialFailedTargets[targetKey] = struct{}{}
+		}
+
+		// Cancellation and budget exhaustion stop the fallback chain immediately.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, appendContextDoneError(allErrors, ctxErr)
+		}
+
+		var validationErr *validateConnectError
+		validationFailed := errors.As(err, &validationErr)
 
 		var sslCertErr *sslCertModeError
 		if errors.As(err, &sslCertErr) {
 			return nil, allErrors
 		}
 
-		var pgErr *PgError
-		if errors.As(err, &pgErr) {
-			// pgx will try next host even if libpq does not in certain cases (see #2246)
-			// consider change for the next major version
+		// ValidateConnect rejection is a failed attempt at this host, not a
+		// protocol/authentication failure that should terminate fallback.
+		if !validationFailed {
+			var pgErr *PgError
+			if errors.As(err, &pgErr) {
+				// pgx will try next host even if libpq does not in certain cases (see #2246)
+				// consider change for the next major version
 
-			const ERRCODE_INVALID_PASSWORD = "28P01"
-			const ERRCODE_INVALID_CATALOG_NAME = "3D000"   // db does not exist
-			const ERRCODE_INSUFFICIENT_PRIVILEGE = "42501" // missing connect privilege
+				const ERRCODE_INVALID_PASSWORD = "28P01"
+				const ERRCODE_INVALID_CATALOG_NAME = "3D000"   // db does not exist
+				const ERRCODE_INSUFFICIENT_PRIVILEGE = "42501" // missing connect privilege
 
-			// auth failed due to invalid password, db does not exist or user has no permission
-			if pgErr.Code == ERRCODE_INVALID_PASSWORD ||
-				pgErr.Code == ERRCODE_INVALID_CATALOG_NAME ||
-				pgErr.Code == ERRCODE_INSUFFICIENT_PRIVILEGE {
-				return nil, allErrors
+				// auth failed due to invalid password, db does not exist or user has no permission
+				if pgErr.Code == ERRCODE_INVALID_PASSWORD ||
+					pgErr.Code == ERRCODE_INVALID_CATALOG_NAME ||
+					pgErr.Code == ERRCODE_INSUFFICIENT_PRIVILEGE {
+					return nil, allErrors
+				}
 			}
 		}
 
@@ -305,21 +359,63 @@ func connectPreferred(ctx context.Context, config *Config, connectOneConfigs []*
 		}
 	}
 
-	if fallbackConnectOneConfig != nil {
-		fallbackCtx := octx
-		if config.ConnectTimeout != 0 {
-			var cancel context.CancelFunc
-			fallbackCtx, cancel = context.WithTimeout(octx, config.ConnectTimeout)
-			defer cancel()
-		}
-		pgConn, err := connectOne(fallbackCtx, config, fallbackConnectOneConfig, true)
-		if err == nil {
+	if fallbackConnectOneConfig != nil && ctx.Err() == nil {
+		pgConn, err := connectOne(ctx, config, fallbackConnectOneConfig, true)
+		if pgConn != nil && err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				closeUndeliveredConnect(pgConn)
+				return nil, appendContextDoneError(allErrors, ctxErr)
+			}
 			return pgConn, nil
 		}
-		allErrors = append(allErrors, err)
+		if pgConn != nil {
+			closeUndeliveredConnect(pgConn)
+		}
+		if err != nil {
+			allErrors = append(allErrors, err)
+		}
+	}
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		allErrors = appendContextDoneError(allErrors, ctxErr)
 	}
 
 	return nil, allErrors
+}
+
+// closeUndeliveredConnect immediately releases a connection that established
+// successfully but cannot be handed to the caller because fallback was stopped.
+// Mark the PgConn closed as well so observers that captured it in a validation
+// or setup callback see the same terminal state as the underlying net.Conn.
+func closeUndeliveredConnect(pgConn *PgConn) {
+	if pgConn == nil {
+		return
+	}
+	if pgConn.conn != nil {
+		_ = pgConn.conn.Close()
+	}
+	if pgConn.status != connStatusClosed {
+		pgConn.status = connStatusClosed
+		close(pgConn.cleanupDone)
+	}
+}
+
+func appendContextDoneError(errs []error, ctxErr error) []error {
+	if ctxErr == nil {
+		return errs
+	}
+
+	for _, err := range errs {
+		if errors.Is(err, ctxErr) {
+			return errs
+		}
+	}
+
+	if ctxErr == context.DeadlineExceeded {
+		ctxErr = &errTimeout{err: context.DeadlineExceeded}
+	}
+
+	return append(errs, ctxErr)
 }
 
 // connectOne makes one connection attempt to a single host.
@@ -350,7 +446,15 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
 
 	pgConn.conn, err = config.DialFunc(ctx, connectConfig.network, connectConfig.address)
 	if err != nil {
-		return nil, newPerDialConnectError("dial error", err)
+		// A DialFunc can return a connection alongside an error (for example, a
+		// connection that was established just as the context was canceled). It
+		// has not been delivered to the caller, so close it.
+		if pgConn.conn != nil {
+			_ = pgConn.conn.Close()
+		}
+		dialErr := newPerDialConnectError("dial error", err)
+		dialErr.dialFailed = true
+		return nil, dialErr
 	}
 
 	var sslCert *sslCertState
@@ -568,11 +672,12 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
 			if config.ValidateConnect != nil {
 				err := config.ValidateConnect(ctx, pgConn)
 				if err != nil {
-					if _, ok := err.(*NotPreferredError); ignoreNotPreferredErr && ok {
+					var npErr *NotPreferredError
+					if errors.As(err, &npErr) && ignoreNotPreferredErr {
 						return pgConn, nil
 					}
 					pgConn.conn.Close()
-					return nil, newPerDialConnectError("ValidateConnect failed", err)
+					return nil, newPerDialConnectError("ValidateConnect failed", &validateConnectError{err: err})
 				}
 			}
 			return pgConn, nil

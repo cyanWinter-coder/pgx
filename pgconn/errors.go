@@ -82,6 +82,7 @@ type perDialConnectError struct {
 	address          string
 	originalHostname string
 	err              error
+	dialFailed       bool
 }
 
 func (e *perDialConnectError) Error() string {
@@ -89,6 +90,27 @@ func (e *perDialConnectError) Error() string {
 }
 
 func (e *perDialConnectError) Unwrap() error {
+	return e.err
+}
+
+func isDialConnectError(err error) bool {
+	var dialErr *perDialConnectError
+	return errors.As(err, &dialErr) && dialErr.dialFailed
+}
+
+// validateConnectError marks an error returned by Config.ValidateConnect. It
+// keeps validation rejections distinct from errors reported while establishing
+// the connection, some of which terminate fallback for compatibility with
+// libpq.
+type validateConnectError struct {
+	err error
+}
+
+func (e *validateConnectError) Error() string {
+	return e.err.Error()
+}
+
+func (e *validateConnectError) Unwrap() error {
 	return e.err
 }
 
@@ -171,6 +193,12 @@ func normalizeTimeoutError(ctx context.Context, err error) error {
 		case context.DeadlineExceeded:
 			return &errTimeout{err: ctx.Err()}
 		default:
+			return &errTimeout{err: err}
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		var timeoutErr *errTimeout
+		if !errors.As(err, &timeoutErr) {
 			return &errTimeout{err: err}
 		}
 	}
