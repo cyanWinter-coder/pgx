@@ -1557,9 +1557,13 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 
 				writeErr := pgConn.frontend.SendUnbufferedEncodedCopyData(*buf)
 				if writeErr != nil {
-					// Write errors are always fatal, but we can't use asyncClose because we are in a different goroutine. Not
-					// setting pgConn.status or closing pgConn.cleanupDone for the same reason.
-					pgConn.conn.Close()
+					// A write that did not send any bytes of the current message can be recovered by resetting the
+					// context deadline and sending CopyFail. Partial writes have corrupted the protocol stream and
+					// are always fatal; as with other cross-goroutine close paths, close the underlying connection
+					// directly because asyncClose touches state owned by the CopyFrom goroutine.
+					if !SafeToRetry(writeErr) {
+						pgConn.conn.Close()
+					}
 
 					copyErrChan <- writeErr
 					return
@@ -1579,32 +1583,42 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 	})
 
 	var pgErr error
+	var serverErr error
 	var copyErr error
-	for copyErr == nil && pgErr == nil {
+	var receiveErr error
+	for copyErr == nil && pgErr == nil && receiveErr == nil {
 		select {
 		case copyErr = <-copyErrChan:
 		case <-signalMessageChan:
 			// If pgConn.receiveMessage encounters an error it will call pgConn.asyncClose. But that is a race condition with
-			// the goroutine. So instead check pgConn.bufferingReceiveErr which will have been set by the signalMessage. If an
-			// error is found then forcibly close the connection without sending the Terminate message.
+			// the goroutine. So instead check pgConn.bufferingReceiveErr which will have been set by the signalMessage. A
+			// timeout caused by context cancellation is recoverable: Unwatch resets the deadline and the cleanup below sends
+			// CopyFail and reads ReadyForQuery. Any other receive error may have left the protocol stream in an unknown state.
 			if err := pgConn.bufferingReceiveErr; err != nil {
+				err = normalizeTimeoutError(ctx, err)
+				if errors.Is(err, context.Canceled) || Timeout(err) {
+					receiveErr = err
+					break
+				}
+
 				pgConn.status = connStatusClosed
 				pgConn.conn.Close()
 				close(pgConn.cleanupDone)
-				return CommandTag{}, normalizeTimeoutError(ctx, err)
+				return CommandTag{}, err
 			}
 			// peekMessage never returns err in the bufferingReceive mode - it only forwards the bufferingReceive variables.
 			// Therefore, the only case for receiveMessage to return err is during handling of the ErrorResponse message type
 			// and using pgOnError handler to determine the connection is no longer valid (and thus closing the conn).
 			msg, serverError := pgConn.receiveMessage()
 			if serverError != nil {
-				close(abortCopyChan)
-				return CommandTag{}, serverError
+				receiveErr = serverError
+				break
 			}
 
 			switch msg := msg.(type) {
 			case *pgproto3.ErrorResponse:
 				pgErr = ErrorResponseToPgError(msg)
+				serverErr = pgErr
 			default:
 				signalMessageChan = pgConn.signalMessage()
 			}
@@ -1614,28 +1628,59 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 	// Make sure io goroutine finishes before writing.
 	wg.Wait()
 
-	if copyErr == io.EOF || pgErr != nil {
+	// The writer may have completed after the select chose the receive or server-error branch. Read its buffered result
+	// without blocking so an encoding error or other original cause is not lost.
+	select {
+	case writerErr := <-copyErrChan:
+		if copyErr == nil {
+			copyErr = writerErr
+		}
+	default:
+	}
+
+	// Stop the context watcher before writing the abort message. If the context was canceled, its handler set a deadline
+	// on the connection; Unwatch's post-cancel hook clears that deadline. The rest of the COPY cleanup must run even
+	// though the caller's context is already done.
+	pgConn.contextWatcher.Unwatch()
+
+	var clientErr error
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		clientErr = normalizeTimeoutError(ctx, copyErr)
+	} else if receiveErr != nil && pgErr == nil {
+		clientErr = receiveErr
+	}
+
+	// A server ErrorResponse received before the abort is the authoritative rejection. Finishing with CopyDone matches
+	// the normal server-error COPY flow. For a client-side read/encode/cancel failure, send CopyFail.
+	if copyErr != nil && errors.Is(copyErr, io.EOF) || pgErr != nil {
 		pgConn.frontend.Send(&pgproto3.CopyDone{})
 	} else {
-		pgConn.frontend.Send(&pgproto3.CopyFail{Message: copyErr.Error()})
+		if clientErr == nil {
+			clientErr = errors.New("COPY FROM aborted before CopyDone")
+		}
+		pgConn.frontend.Send(&pgproto3.CopyFail{Message: clientErr.Error()})
 	}
 	err = pgConn.flushWithPotentialWriteReadDeadlock()
 	if err != nil {
 		pgConn.asyncClose()
-		return CommandTag{}, normalizeTimeoutError(ctx, err)
+		return CommandTag{}, errors.Join(clientErr, normalizeTimeoutError(ctx, err))
 	}
 
-	// Read results
+	// Read results. ErrorResponse messages caused by our own CopyFail are drained so the backend reaches
+	// ReadyForQuery and the connection is reusable. They do not replace the client-side cause.
 	var commandTag CommandTag
 	for {
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
 			pgConn.asyncClose()
-			return CommandTag{}, normalizeTimeoutError(ctx, err)
+			return CommandTag{}, errors.Join(clientErr, normalizeTimeoutError(ctx, err))
 		}
 
 		switch msg := msg.(type) {
 		case *pgproto3.ReadyForQuery:
+			if clientErr != nil && serverErr == nil {
+				return commandTag, clientErr
+			}
 			return commandTag, pgErr
 		case *pgproto3.CommandComplete:
 			commandTag = pgConn.makeCommandTag(msg.CommandTag)

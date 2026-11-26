@@ -2909,14 +2909,13 @@ func TestConnCopyFromCanceled(t *testing.T) {
 	ct, err := pgConn.CopyFrom(ctx, r, copySql)
 	cancel()
 	assert.Equal(t, int64(0), ct.RowsAffected())
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 
-	assert.True(t, pgConn.IsClosed())
-	select {
-	case <-pgConn.CleanupDone():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Connection cleanup exceeded maximum time")
-	}
+	// A cancellation while COPY is in flight aborts the copy with CopyFail and drains the server response. The
+	// connection must remain reusable instead of requiring a new connection pool.
+	assert.False(t, pgConn.IsClosed())
+	ensureConnValid(t, pgConn)
 }
 
 func TestConnCopyFromPrecanceled(t *testing.T) {

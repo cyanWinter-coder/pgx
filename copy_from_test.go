@@ -2,6 +2,7 @@ package pgx_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -775,12 +776,16 @@ func TestConnCopyFromCopyFromSourceErrorMidway(t *testing.T) {
 		a bytea not null
 	)`)
 
-	copyCount, err := conn.CopyFrom(ctx, pgx.Identifier{"foo"}, []string{"a"}, &clientFailSource{})
+	cfs := &clientFailSource{}
+	copyCount, err := conn.CopyFrom(ctx, pgx.Identifier{"foo"}, []string{"a"}, cfs)
 	if err == nil {
 		t.Errorf("Expected CopyFrom return error, but it did not")
 	}
-	if copyCount != 0 {
-		t.Errorf("Expected CopyFrom to return 0 copied rows, but got %d", copyCount)
+	if !errors.Is(err, cfs.err) {
+		t.Errorf("Expected error to preserve client error %v, but got: %v", cfs.err, err)
+	}
+	if copyCount != 2 {
+		t.Errorf("Expected CopyFrom to return 2 rows written before the client error, but got %d", copyCount)
 	}
 
 	rows, err := conn.Query(ctx, "select * from foo")

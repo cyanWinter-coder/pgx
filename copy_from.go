@@ -3,6 +3,7 @@ package pgx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -160,21 +161,27 @@ func (ct *copyFrom) run(ctx context.Context) (int64, error) {
 
 	r, w := io.Pipe()
 	doneChan := make(chan struct{})
+	var writtenRowCount int64
 
 	go func() {
 		defer close(doneChan)
 
-		// Purposely NOT using defer w.Close(). See https://github.com/golang/go/issues/24283.
-		buf := ct.conn.wbuf
+		// ct.conn.wbuf is retained on the connection so a large COPY encoding buffer is reused by later CopyFrom
+		// calls. The deferred write-back also runs on encoding failures, where buildCopyBuf returns the buffer rather
+		// than nil. Resetting the length discards a partially encoded row while preserving its capacity.
+		buf := ct.conn.wbuf[:0]
+		defer func() { ct.conn.wbuf = buf[:0] }()
 
+		// Purposely NOT using defer w.Close(). See https://github.com/golang/go/issues/24283.
 		buf = append(buf, "PGCOPY\n\377\r\n\000"...)
 		buf = pgio.AppendInt32(buf, 0)
 		buf = pgio.AppendInt32(buf, 0)
 
 		moreRows := true
 		for moreRows {
+			var rowCount int64
 			var err error
-			moreRows, buf, err = ct.buildCopyBuf(buf, sd)
+			moreRows, rowCount, buf, err = ct.buildCopyBuf(buf, sd)
 			if err != nil {
 				w.CloseWithError(err)
 				return
@@ -191,6 +198,7 @@ func (ct *copyFrom) run(ctx context.Context) (int64, error) {
 					w.Close()
 					return
 				}
+				writtenRowCount += rowCount
 			}
 
 			buf = buf[:0]
@@ -199,7 +207,23 @@ func (ct *copyFrom) run(ctx context.Context) (int64, error) {
 		w.Close()
 	}()
 
-	commandTag, err := ct.conn.pgConn.CopyFrom(ctx, r, fmt.Sprintf("copy %s ( %s ) from stdin binary;", quotedTableName, quotedColumnNames))
+	// pgConn.CopyFrom only observes ctx through its network deadline watcher. Once cancellation fires, close the pipe
+	// so its reader goroutine cannot remain blocked in Read and prevent CopyFail cleanup. Closing with context.Cause
+	// preserves a custom cancellation cause in the returned error chain.
+	stopContextPipeCloser := context.AfterFunc(ctx, func() {
+		err := context.Cause(ctx)
+		if err == nil {
+			err = ctx.Err()
+		}
+		w.CloseWithError(err)
+	})
+
+	// Detach cancellation from pgconn's deadline watcher. Canceling a network write halfway through a CopyData
+	// message would make the protocol stream unrecoverable. Instead, stop the row source through the pipe closer
+	// above, let any in-progress write reach a message boundary, and then send CopyFail and drain the backend.
+	copyCtx := context.WithoutCancel(ctx)
+	commandTag, err := ct.conn.pgConn.CopyFrom(copyCtx, r, fmt.Sprintf("copy %s ( %s ) from stdin binary;", quotedTableName, quotedColumnNames))
+	stopContextPipeCloser()
 
 	r.Close()
 	<-doneChan
@@ -211,32 +235,49 @@ func (ct *copyFrom) run(ctx context.Context) (int64, error) {
 		})
 	}
 
-	return commandTag.RowsAffected(), err
+	rowsAffected := commandTag.RowsAffected()
+	if err != nil && rowsAffected == 0 {
+		// The server does not provide a row count for an aborted COPY. For a client-side encoding or cancellation
+		// failure, report the rows that were successfully handed to the COPY protocol writer. Server rejections keep
+		// the authoritative CommandTag/PgError result (normally zero affected rows because COPY is transactional).
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			rowsAffected = writtenRowCount
+		}
+	}
+
+	return rowsAffected, err
 }
 
-func (ct *copyFrom) buildCopyBuf(buf []byte, sd *pgconn.StatementDescription) (bool, []byte, error) {
+func (ct *copyFrom) buildCopyBuf(buf []byte, sd *pgconn.StatementDescription) (bool, int64, []byte, error) {
 	const sendBufSize = 65536 - 5 // The packet has a 5-byte header
 	lastBufLen := 0
 	largestRowLen := 0
+	var rowCount int64
 
 	for ct.rowSrc.Next() {
 		lastBufLen = len(buf)
 
 		values, err := ct.rowSrc.Values()
 		if err != nil {
-			return false, nil, err
+			return false, rowCount, buf, err
 		}
 		if len(values) != len(ct.columnNames) {
-			return false, nil, fmt.Errorf("expected %d values, got %d values", len(ct.columnNames), len(values))
+			return false, rowCount, buf, fmt.Errorf("expected %d values, got %d values", len(ct.columnNames), len(values))
 		}
 
 		buf = pgio.AppendInt16(buf, int16(len(ct.columnNames)))
 		for i, val := range values {
-			buf, err = encodeCopyValue(ct.conn.typeMap, buf, sd.Fields[i].DataTypeOID, val)
-			if err != nil {
-				return false, nil, err
+			encodedBuf, encodeErr := encodeCopyValue(ct.conn.typeMap, buf, sd.Fields[i].DataTypeOID, val)
+			if encodeErr != nil {
+				// Discard the partially appended failed row while retaining all complete rows that preceded it.
+				// Keep using the pre-call buf because encodeCopyValue returns a nil buffer on error.
+				buf = buf[:lastBufLen]
+				return false, rowCount, buf, encodeErr
 			}
+			buf = encodedBuf
 		}
+		rowCount++
 
 		rowLen := len(buf) - lastBufLen
 		if rowLen > largestRowLen {
@@ -247,15 +288,20 @@ func (ct *copyFrom) buildCopyBuf(buf []byte, sd *pgconn.StatementDescription) (b
 		// io.Pipe means that the next Read will be short. This can lead to pathological send sizes such as 65531, 13, 65531
 		// 13, 65531, 13, 65531, 13.
 		if len(buf) > sendBufSize-largestRowLen {
-			return true, buf, nil
+			return true, rowCount, buf, nil
 		}
 	}
 
-	return false, buf, nil
+	return false, rowCount, buf, nil
 }
 
 // CopyFrom uses the PostgreSQL copy protocol to perform bulk data insertion. It returns the number of rows copied and
 // an error.
+//
+// If encoding or reading the source fails after some complete row batches have been written to the connection, the
+// returned count includes those rows. The original source or encoding error remains in the error chain. A rejection
+// reported by the server returns the server's CommandTag count (zero for an aborted COPY) and a [*pgconn.PgError].
+// The connection is drained and remains usable after these errors.
 //
 // CopyFrom requires all values use the binary format. A pgtype.Type that supports the binary format must be registered
 // for the type of each column. Almost all types implemented by pgx support the binary format.
